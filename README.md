@@ -1,130 +1,149 @@
-# Dino Crisis 2 — DX9 Texture Dumper & Replacer
+# Dino Crisis 2 — HD Texture Toolkit
 
-An ASI plugin for dumping and replacing **all** textures in Dino Crisis 2 (Sourcenext) with the Classic Rebirth patch.
+A toolset for dumping, replacing, and generating high-resolution textures for Dino Crisis 2 (Classic Rebirth patch). Includes HD mask generation, real-time texture replacement, and optional water effects.
 
-Intercepts DX9 calls `SetTexture` and `EndScene` via detour hooks at the `d3d9.dll` level, ensuring compatibility with any version of Classic Rebirth.
+## Problem
 
-## Features
+Dino Crisis 2 uses pre-rendered backgrounds (320×240) with overlay masks (512×512) that create depth by covering the player character. When backgrounds are replaced with AI-upscaled HD versions, the original low-resolution masks cause visible seams and pixelation. Simply upscaling the masks doesn't work because their pixels must exactly match the corresponding background pixels.
 
-- **Dump** all game textures in WebP format (backgrounds, masks, sprites, 3D textures, UI)
-- **Replace** textures from `hires\textures\` — arbitrary resolution supported
-- **Auto-detect room changes** — two-level cache with quick hashing prevents texture bleed from previous scenes
-- **Correct alpha** — backgrounds (320×240) are saved as fully opaque, masks and sprites preserve transparency
+## Solution
+
+This toolset intercepts the game's rendering pipeline to record which mask texture belongs to which background and how each mask tile maps to screen coordinates. A Python script then uses this mapping to cut HD mask textures directly from the upscaled backgrounds, ensuring pixel-perfect alignment with zero seams.
 
 ## Requirements
 
-- **Dino Crisis 2** (Sourcenext, Japanese edition)
-- **Classic Rebirth** (`ddraw.dll`) — DX9 wrapper for the game
-- **ASI Loader** (`dinput.dll`) — e.g. Ultimate ASI Loader
-- **libwebp.dll** — WebP encoding/decoding library (from TeamX mod or downloaded separately)
+- Dino Crisis 2 (PC) with [Classic Rebirth](https://github.com/AceVentura/ClassicRebirth) patch (ddraw.dll → D3D9 wrapper)
+- **4GB Patch Tool** — apply to the game executable (`dino2.exe`). HD textures (1280×960 backgrounds, 2048×2048 masks) exceed the default 2 GB memory limit of a 32-bit process. Without this patch the game will crash after loading ~30–50 HD textures. Download: [ntcore.com/4gb-patch](https://ntcore.com/4gb-patch/) or any equivalent Large Address Aware patcher.
+- MSVC x86 (Visual Studio Developer Command Prompt) for building ASI plugins
+- Python 3.8+ with Pillow (`pip install Pillow`) for HD mask generation
+- `libwebp.dll` (32-bit) in the game directory — required by the texture replacement plugin for WebP decoding
+- **Game resolution must be set to 1280×960** in Classic Rebirth settings when collecting diagnostic data
 
-## Installation
+## Components
 
-1. Make sure Classic Rebirth (`ddraw.dll`) is installed and the game runs
-2. Place the following files in the same folder as `Dino2.exe`:
-   - `dino2hd_ext.asi`
-   - `dinput.dll` (ASI Loader)
-   - `libwebp.dll`
-3. Launch the game
+| File | Description |
+|------|-------------|
+| `dino2hd_ext.c` | ASI plugin — real-time texture dumping and replacement with LRU eviction and VRAM budget |
+| `dc2_diag.c` | ASI plugin — hooks D3D9 draw calls and logs background→mask tile mappings to `dc2_pairs.tsv` |
+| `make_hd_masks.py` | Python script — reads the TSV and generates HD masks by cutting from upscaled backgrounds |
+| `mask_overrides.tsv` | Optional manual corrections for misidentified background→mask pairs |
+| `water_hashes.txt` | List of water texture hashes for animated water effects (optional) |
+| `dump.txt` | Empty file — place in game directory to enable texture dumping mode |
 
-## File Structure
+## Texture Replacement Plugin (dino2hd_ext)
+
+The main plugin that dumps original textures and replaces them with HD versions at runtime.
+
+### Build
 
 ```
-Dino2.exe
-ddraw.dll              ← Classic Rebirth
-dinput.dll             ← ASI Loader
-dino2hd_ext.asi        ← this plugin
-libwebp.dll            ← WebP codec
-dino2hd_ext.log        ← log (created automatically)
-dump/
-  textures/
-    A3F7B210_320x240.webp   ← dumped textures
-    ...
-hires/
-  textures/
-    A3F7B210_320x240.webp   ← replacements (same filename)
-    ...
-```
-
-## Usage
-
-### Dumping Textures
-
-1. Launch the game with the plugin installed
-2. Load a save, walk around the locations
-3. Textures are automatically saved to `dump\textures\`
-4. Filename format: `<HASH>_<W>x<H>.webp`, where HASH is the FNV-1a hash of the texture content
-
-### Replacing Textures
-
-1. Copy the desired file from `dump\textures\` to `hires\textures\` (filename must match exactly)
-2. Edit the file in an image editor (GIMP, Photoshop, etc.)
-3. Save as WebP (lossless recommended)
-4. Restart the game — the replacement will be applied automatically
-
-> **Replacement size can differ from the original.** The plugin creates a new DX9 texture of the required size. For example, an original 320×240 background can be replaced with a 1280×960 image.
-
-### Configuration
-
-Modes are set in the source code (requires recompilation):
-
-```c
-static int g_dump    = 1;  // 1 = dump textures
-static int g_replace = 1;  // 1 = replace from hires\textures\
-```
-
-## Building from Source
-
-### MSVC (Visual Studio)
-
-Open **x86 Native Tools Command Prompt**:
-
-```cmd
 cl /LD /O2 dino2hd_ext.c /link /OUT:dino2hd_ext.asi kernel32.lib user32.lib
 ```
 
-### MinGW (MSYS2)
+Place `dino2hd_ext.asi` and `libwebp.dll` in the game directory.
 
-In **MSYS2 MINGW32** terminal:
+### Dumping Textures
 
-```bash
-pacman -S mingw-w64-i686-gcc   # once
-i686-w64-mingw32-gcc -shared -O2 -o dino2hd_ext.asi dino2hd_ext.c -lkernel32 -luser32
+By default, dumping is **disabled**. To enable it, create an empty file named `dump.txt` in the game directory:
+
+```
+echo. > dump.txt
 ```
 
-> **Important:** 32-bit (x86) only. The game is 32-bit.
+With `dump.txt` present, the plugin will save all game textures as WebP files to `dump/textures/` (e.g., `BA06487B_320x240.webp`). Remove `dump.txt` when you no longer need dumping — this improves performance during normal gameplay.
 
-## Texture Types
+### Replacing Textures
 
-| Size | Type | Alpha in dump |
-|------|------|---------------|
-| 320×240 | Pre-rendered background | Opaque (alpha = 255) |
-| 256×256, 128×128, ... | 3D textures, masks | Original from pixel data |
-| Other | Sprites, UI | Original from pixel data |
+Texture replacement is **always enabled**. Place your HD textures in `hires/textures/` using the same filename as the original dump (hash + original resolution):
+
+```
+hires/textures/BA06487B_320x240.webp    ← HD background (e.g., 1280×960)
+hires/textures/F9F692E7_512x512.webp    ← HD mask (e.g., 2048×2048)
+```
+
+The plugin automatically detects and replaces textures at runtime. It uses a 1.2 GB VRAM budget with LRU eviction — when memory is full, the least recently used textures are released and reloaded from disk on demand.
+
+### Log
+
+The plugin writes status information to `dino2hd_ext.log`, including loaded textures, VRAM usage, and eviction events.
+
+---
+
+## HD Mask Generation
+
+### Step 1: Build the Diagnostic Plugin
+
+Open an **x86 Developer Command Prompt** and run:
+
+```
+cl /LD /O2 dc2_diag.c /link /OUT:dc2_diag.asi kernel32.lib user32.lib
+```
+
+Place `dc2_diag.asi` in the game directory alongside the executable.
+
+### Step 2: Collect Data
+
+1. **Set game resolution to 1280×960** (this is critical — the coordinate mapping depends on a consistent resolution).
+2. Launch the game with the plugin loaded.
+3. Play through all areas you want to generate HD masks for. Each room is recorded automatically when you enter it.
+4. Press **Insert** at any time to flush collected data to `dc2_pairs.tsv`.
+5. Data is also auto-flushed every 30 seconds. The TSV file is append-only — data survives crashes and persists across sessions.
+
+### Step 3: Prepare Textures
+
+Make sure you have:
+- **Original texture dumps** in `dump/textures/` (e.g., `BA06487B_320x240.webp` for backgrounds, `F9F692E7_512x512.webp` for masks)
+- **Upscaled HD backgrounds** in `hires/textures/` (e.g., `BA06487B_320x240.webp` at 1280×960 resolution)
+
+The HD background filenames must match the original dump filenames (hash + original resolution).
+
+### Step 4: Generate HD Masks
+
+```bash
+# Generate all detected masks
+python make_hd_masks.py
+
+# Test a single background
+python make_hd_masks.py --test BA06487B
+
+# Custom paths
+python make_hd_masks.py --tsv dc2_pairs.tsv --dump dump/textures --hires hires/textures --out hires/textures
+```
+
+Output HD masks are saved to `hires/textures/` with the original filename (e.g., `F9F692E7_512x512.webp`), ready for the texture replacement plugin to load.
+
+## Manual Overrides
+
+In rare cases (usually during room transitions), the plugin may associate a mask with the wrong background. Create or edit `mask_overrides.tsv` to correct these:
+
+```
+# Format: bg_hash	mask_hash
+526B109C	413FEA13
+A11E80A0	4DEA6744
+```
+
+The Python script loads overrides automatically and applies them on top of auto-detected pairs.
 
 ## How It Works
 
-1. On load, the ASI creates a temporary DX9 device to obtain the addresses of `EndScene` and `SetTexture` functions inside `d3d9.dll`
-2. Installs **detour hooks** (overwriting the first bytes of each function with a `JMP`) — this intercepts calls through any device, including the one created by Classic Rebirth
-3. On each `SetTexture` call:
-   - A **quick hash** (3 pixel rows) is computed to detect content changes
-   - If content has changed — a **full hash** is computed and a replacement is looked up
-   - Results are cached for 30 frames
-4. Replacements are stored in a separate `hash → DX9 texture` cache and reused across frames
+1. **Plugin** hooks `SetTexture` and `DrawPrimitiveUP` in the D3D9 pipeline.
+2. Backgrounds are identified as 320×240 textures drawn fullscreen with UV coordinates spanning 0–1.
+3. Masks are identified as 512×512 textures drawn as multiple tile quads on top of the background.
+4. Each tile's UV region (which part of the mask texture) and destination rectangle (where on screen) are recorded.
+5. **Python script** uses these coordinates to map each mask pixel to its corresponding position in the HD background, then copies the HD pixels to create a seamless HD mask.
 
 ## Troubleshooting
 
-- **Game won't start:** verify that `dinput.dll` is an ASI Loader, not the original DirectInput file
-- **Log is empty:** ASI Loader is not loading the plugin. Make sure the file has the `.asi` extension
-- **`frames=0` in log:** Classic Rebirth did not create a DX9 device. Verify that `ddraw.dll` is Classic Rebirth
-- **Textures not dumping:** check that `libwebp.dll` is present in the game folder
-- **Replacement not applied:** the filename in `hires\textures\` must **exactly** match the one in `dump\textures\`
-
-## License
-
-Free to use. Created for the Dino Crisis 2 modding community.
+| Issue | Solution |
+|-------|----------|
+| Game crashes after ~15 minutes | Apply 4GB Patch Tool to `dino2.exe`. HD textures exceed the 2 GB limit. |
+| Textures not replacing | Check that `libwebp.dll` is in the game directory and HD files are in `hires/textures/` with correct filenames. |
+| `0 pairs` in diag log | Make sure you're in a game room (not menu/cutscene). Walk around to trigger mask rendering. |
+| Wrong mask assigned to background | Add the correct mapping to `mask_overrides.tsv`. |
+| Seams between mask tiles | Ensure all data was collected at the same resolution (1280×960). Re-collect if resolution was changed. |
+| Plugins conflict / crash | Never use `dc2_diag.asi` and `dino2hd_ext.asi` at the same time — they hook the same D3D9 functions. |
+| Dump not working | Create an empty `dump.txt` in the game directory. Remove it when done. |
 
 ## Credits
 
-- **TeamX** — original HD Mod for backgrounds and masks, libwebp
-- **Classic Rebirth** — DX9 wrapper for the Sourcenext version
+Designed for use with the [Classic Rebirth](https://github.com/AceVentura/ClassicRebirth) DirectDraw→D3D9 wrapper for Dino Crisis 2.
