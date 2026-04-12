@@ -1,6 +1,6 @@
 /*
- * Dino Crisis 2 — DX9 Texture Dumper + Replacer v4
- * FIX: handles texture object reuse across room changes.
+ * Dino Crisis 2 — DX9 Texture Dumper + Replacer v6
+ * Hash-table caches, negative caching, LRU eviction with VRAM budget.
  *
  * BUILD (MSVC x86):
  *   cl /LD /O2 dino2hd_ext.c /link /OUT:dino2hd_ext.asi kernel32.lib user32.lib
@@ -123,49 +123,142 @@ static BOOL detour_install(detour_t *d, void *target, void *hook) {
     return TRUE;
 }
 
+/* ═══ GLOBALS (forward decl needed by caches) ═══ */
+static int g_frames = 0, g_settex_calls = 0;
+static int g_dump_count = 0, g_replace_count = 0;
+
 /* ═══════════════════════════════════════════════════════════════
- * CACHE 1: hash → replacement texture (persistent)
- * Загруженные HD текстуры живут до конца сессии.
+ * CACHE 1: content hash → replacement texture (LRU eviction)
+ * Open-addressing hash table with linear probing.
+ * Tracks VRAM usage; evicts least-recently-used when over budget.
  * ═══════════════════════════════════════════════════════════════ */
-#define MAX_REPL 1024
+#define REPL_SIZE 8192  /* power of 2, ~50% load = 4096 entries max */
+#define REPL_MASK (REPL_SIZE - 1)
+#define VRAM_BUDGET (1200ULL * 1024 * 1024)  /* 1.2 GB max for HD textures */
+
+typedef ULONG(WINAPI *Release_t)(void*);
+
 typedef struct {
-    uint32_t hash;
+    uint32_t hash;       /* 0 = empty */
     UINT orig_w, orig_h;
     IDirect3DTexture9 *tex;
+    BOOL has_file;
+    int  last_frame;     /* last frame this texture was used */
+    UINT tex_bytes;      /* approx memory of this HD texture */
 } repl_entry_t;
-static repl_entry_t g_repl[MAX_REPL];
+static repl_entry_t g_repl[REPL_SIZE];
 static int g_nrepl = 0;
+static uint64_t g_vram_used = 0;
 
-static IDirect3DTexture9 *find_replacement(uint32_t hash) {
-    for (int i = 0; i < g_nrepl; i++)
-        if (g_repl[i].hash == hash) return g_repl[i].tex;
+static IDirect3DTexture9 *find_replacement(uint32_t hash, BOOL *checked) {
+    *checked = FALSE;
+    uint32_t slot = hash & REPL_MASK;
+    for (int i = 0; i < 64; i++) {
+        repl_entry_t *e = &g_repl[(slot + i) & REPL_MASK];
+        if (e->hash == 0) return NULL;
+        if (e->hash == hash) {
+            *checked = TRUE;
+            if (e->has_file && e->tex) {
+                e->last_frame = g_frames;
+                return e->tex;
+            }
+            if (e->has_file && !e->tex) {
+                /* Was evicted — need reload. Signal "not checked" so caller reloads. */
+                *checked = FALSE;
+                e->hash = 0;  /* clear slot so store_replacement can reuse it */
+                g_nrepl--;
+                return NULL;
+            }
+            return NULL;  /* has_file=FALSE → no file on disk */
+        }
+    }
     return NULL;
 }
 
+static void evict_lru(void) {
+    /* Find and release the least-recently-used loaded texture */
+    int best_idx = -1;
+    int best_frame = 0x7FFFFFFF;
+    for (int i = 0; i < REPL_SIZE; i++) {
+        repl_entry_t *e = &g_repl[i];
+        if (e->hash && e->has_file && e->tex && e->last_frame < best_frame) {
+            best_frame = e->last_frame;
+            best_idx = i;
+        }
+    }
+    if (best_idx >= 0) {
+        repl_entry_t *e = &g_repl[best_idx];
+        void **vt = *(void***)e->tex;
+        ((Release_t)vt[VT_Release])(e->tex);
+        g_vram_used -= e->tex_bytes;
+        LOG("Evicted %08X (%ux%u, %u KB, frame %d)\n",
+            e->hash, e->orig_w, e->orig_h, e->tex_bytes/1024, e->last_frame);
+        e->tex = NULL;  /* keep slot: has_file=TRUE, tex=NULL → "evicted, can reload" */
+    }
+}
+
+static void store_replacement(uint32_t hash, UINT orig_w, UINT orig_h,
+                              IDirect3DTexture9 *tex, BOOL has_file, UINT tex_bytes) {
+    uint32_t slot = hash & REPL_MASK;
+    for (int i = 0; i < 64; i++) {
+        repl_entry_t *e = &g_repl[(slot + i) & REPL_MASK];
+        if (e->hash == 0 || e->hash == hash) {
+            BOOL is_new = (e->hash == 0);
+            e->hash = hash; e->orig_w = orig_w; e->orig_h = orig_h;
+            e->tex = tex; e->has_file = has_file;
+            e->last_frame = g_frames;
+            e->tex_bytes = tex_bytes;
+            if (is_new) g_nrepl++;
+            if (tex) g_vram_used += tex_bytes;
+            return;
+        }
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════
- * CACHE 2: pointer → (quick_hash, frame) (transient)
- * Quick hash пересчитывается каждые N кадров для обнаружения
- * смены контента текстуры (при смене комнаты).
+ * CACHE 2: texture pointer → (quick_hash, full_hash, frame)
+ * Open-addressing hash table with linear probing.
  * ═══════════════════════════════════════════════════════════════ */
-#define MAX_PTR 4096
-#define RECHECK_INTERVAL 30  /* пересчитывать хеш каждые 30 кадров */
+#define PTR_SIZE 16384  /* power of 2 */
+#define PTR_MASK (PTR_SIZE - 1)
+#define RECHECK_INTERVAL 2
 
 typedef struct {
-    IDirect3DTexture9 *ptr;
-    uint32_t full_hash;      /* полный хеш (для дампа/замены) */
-    uint32_t quick_hash;     /* быстрый хеш (для обнаружения изменений) */
-    int      last_frame;     /* кадр последней проверки */
+    IDirect3DTexture9 *ptr;  /* NULL = empty */
+    uint32_t full_hash;
+    uint32_t quick_hash;
+    int      last_frame;
     UINT     w, h;
     DWORD    fmt;
     BOOL     dumped;
 } ptrcache_t;
-static ptrcache_t g_ptrcache[MAX_PTR];
-static int g_nptr = 0;
+static ptrcache_t g_ptrcache[PTR_SIZE];
 
 static ptrcache_t *find_ptr(IDirect3DTexture9 *p) {
-    for (int i = 0; i < g_nptr; i++)
-        if (g_ptrcache[i].ptr == p) return &g_ptrcache[i];
+    uint32_t slot = ((uint32_t)(uintptr_t)p >> 4) & PTR_MASK;
+    for (int i = 0; i < 64; i++) {
+        ptrcache_t *pc = &g_ptrcache[(slot + i) & PTR_MASK];
+        if (pc->ptr == NULL) return NULL;   /* empty = not found */
+        if (pc->ptr == p) return pc;
+    }
     return NULL;
+}
+
+static ptrcache_t *alloc_ptr(IDirect3DTexture9 *p) {
+    uint32_t slot = ((uint32_t)(uintptr_t)p >> 4) & PTR_MASK;
+    for (int i = 0; i < 64; i++) {
+        ptrcache_t *pc = &g_ptrcache[(slot + i) & PTR_MASK];
+        if (pc->ptr == NULL || pc->ptr == p) {
+            memset(pc, 0, sizeof(*pc));
+            pc->ptr = p;
+            return pc;
+        }
+    }
+    /* All 64 probe slots full — evict the first one (extremely rare) */
+    ptrcache_t *pc = &g_ptrcache[slot];
+    memset(pc, 0, sizeof(*pc));
+    pc->ptr = p;
+    return pc;
 }
 
 /* ═══ HASHING ═══ */
@@ -194,8 +287,6 @@ static uint32_t full_hash(void *bits, int pitch, UINT w, UINT h, int bpp) {
 /* ═══ GLOBALS ═══ */
 static CRITICAL_SECTION g_cs;
 static IDirect3DDevice9 *g_dev = NULL;
-static int g_frames = 0, g_settex_calls = 0;
-static int g_dump_count = 0, g_replace_count = 0;
 
 /* ═══ PIXEL CONVERSION ═══ */
 static void convert_row_to_bgra(uint8_t* dst, uint8_t* src, UINT w, DWORD fmt, BOOL force_opaque) {
@@ -256,14 +347,18 @@ static void dump_texture(uint32_t hash, void *bits, int pitch, UINT w, UINT h, D
 static IDirect3DTexture9 *load_replacement(uint32_t hash, UINT orig_w, UINT orig_h) {
     if (!g_dev || !g_webp) return NULL;
 
-    /* Уже загружена? */
-    IDirect3DTexture9 *cached = find_replacement(hash);
-    if (cached) return cached;
+    /* Уже проверяли этот хеш? */
+    BOOL checked;
+    IDirect3DTexture9 *cached = find_replacement(hash, &checked);
+    if (checked) return cached;  /* returns tex or NULL (no file) */
 
     char path[260];
     sprintf(path, "hires\\textures\\%08X_%ux%u.webp", hash, orig_w, orig_h);
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    if (!f) {
+        store_replacement(hash, orig_w, orig_h, NULL, FALSE, 0);
+        return NULL;
+    }
     fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
     uint8_t *buf = (uint8_t*)malloc(sz);
     if (!buf) { fclose(f); return NULL; }
@@ -274,7 +369,16 @@ static IDirect3DTexture9 *load_replacement(uint32_t hash, UINT orig_w, UINT orig
     free(buf);
     if (!pixels) return NULL;
 
-    LOG("Loading hires: %s (%dx%d)\n", path, w, h);
+    UINT tex_bytes = (UINT)w * (UINT)h * 4;
+
+    /* Evict LRU textures if over memory budget */
+    while (g_vram_used + tex_bytes > VRAM_BUDGET) {
+        evict_lru();
+        if (g_vram_used == 0) break;  /* nothing left to evict */
+    }
+
+    LOG("Loading hires: %s (%dx%d, %u KB, vram=%u MB)\n",
+        path, w, h, tex_bytes/1024, (unsigned)(g_vram_used/(1024*1024)));
 
     void **dev_vt = *(void***)g_dev;
     IDirect3DTexture9 *newtex = NULL;
@@ -288,20 +392,13 @@ static IDirect3DTexture9 *load_replacement(uint32_t hash, UINT orig_w, UINT orig
         for (int y = 0; y < h; y++) {
             uint8_t *src = pixels + y*w*4;
             uint8_t *dst = (uint8_t*)lr.pBits + y*lr.Pitch;
-            memcpy(dst, src, w*4); /* BGRA→BGRA, совпадает */
+            memcpy(dst, src, w*4);
         }
         ((TexUnlockRect_t)tvt[VT_TEX_UnlockRect])(newtex, 0);
     }
     pWFree(pixels);
 
-    /* Сохраняем в кэш замен */
-    if (g_nrepl < MAX_REPL) {
-        g_repl[g_nrepl].hash = hash;
-        g_repl[g_nrepl].orig_w = orig_w;
-        g_repl[g_nrepl].orig_h = orig_h;
-        g_repl[g_nrepl].tex = newtex;
-        g_nrepl++;
-    }
+    store_replacement(hash, orig_w, orig_h, newtex, TRUE, tex_bytes);
     g_replace_count++;
     return newtex;
 }
@@ -334,31 +431,28 @@ static IDirect3DTexture9 *process_texture(IDirect3DTexture9 *tex) {
 
     if (pc) {
         if (pc->quick_hash != qh) {
-            /* Контент изменился! Сброс. */
             content_changed = TRUE;
             pc->quick_hash = qh;
             pc->full_hash = 0;
             pc->dumped = FALSE;
             pc->last_frame = g_frames;
         } else if (g_frames - pc->last_frame < RECHECK_INTERVAL) {
-            /* Недавно проверяли, контент не изменился — используем кэш */
             uint32_t fh = pc->full_hash;
             LeaveCriticalSection(&g_cs);
             ((TexUnlockRect_t)vt[VT_TEX_UnlockRect])(tex, 0);
-            return (g_replace && fh) ? find_replacement(fh) : NULL;
+            if (g_replace && fh) {
+                BOOL chk;
+                return find_replacement(fh, &chk);
+            }
+            return NULL;
         }
         pc->last_frame = g_frames;
-    } else if (g_nptr < MAX_PTR) {
-        pc = &g_ptrcache[g_nptr++];
-        memset(pc, 0, sizeof(*pc));
-        pc->ptr = tex;
+    } else {
+        /* Новая текстура (или коллизия слота — вытеснение автоматическое) */
+        pc = alloc_ptr(tex);
         pc->quick_hash = qh;
         pc->last_frame = g_frames;
-        content_changed = TRUE; /* новая текстура */
-    } else {
-        LeaveCriticalSection(&g_cs);
-        ((TexUnlockRect_t)vt[VT_TEX_UnlockRect])(tex, 0);
-        return NULL;
+        content_changed = TRUE;
     }
 
     LeaveCriticalSection(&g_cs);
@@ -448,17 +542,18 @@ static BOOL install_hooks(void) {
 
 /* ═══ THREAD ═══ */
 static DWORD WINAPI init_thread(LPVOID x) {
-    LOG("\n===== DC2 Texture Hook v4 =====\n");
+    LOG("\n===== DC2 Texture Hook v6 (LRU eviction) =====\n");
     Sleep(5000);
     InitializeCriticalSection(&g_cs);
     load_webp();
     CreateDirectoryA("hires",NULL); CreateDirectoryA("hires\\textures",NULL);
     if (!install_hooks()) { LOG("FATAL\n"); return 1; }
-    for (int i=0;i<120;i++) {
+    for (int i=0;i<600;i++) {
         Sleep(5000);
         if (i<20||(i%12==0))
-            LOG("[%ds] fr=%d st=%d ptr=%d repl=%d dump=%d\n",
-                (i+1)*5,g_frames,g_settex_calls,g_nptr,g_replace_count,g_dump_count);
+            LOG("[%ds] fr=%d st=%d repl=%d/%d dump=%d vram=%uMB\n",
+                (i+1)*5,g_frames,g_settex_calls,g_nrepl,g_replace_count,g_dump_count,
+                (unsigned)(g_vram_used/(1024*1024)));
     }
     return 0;
 }
