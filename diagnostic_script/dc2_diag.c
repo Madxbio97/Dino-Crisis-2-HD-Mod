@@ -1,7 +1,9 @@
 /*
- * Dino Crisis 2 — BG/Mask Pair Logger v3
+ * Dino Crisis 2 — BG/Mask Pair Logger v4
  * Logs (background_hash -> overlay_hash) pairs to dc2_pairs.tsv
- * INSERT = flush now, auto-flush every 60s
+ * INSERT = flush now, auto-flush every 30s
+ * Incremental save: appends new data, survives crashes.
+ * Data persists across sessions — delete dc2_pairs.tsv for a fresh start.
  *
  * BUILD (MSVC x86):
  *   cl /LD /O2 dc2_diag.c /link /OUT:dc2_diag.asi kernel32.lib user32.lib
@@ -178,19 +180,31 @@ static BOOL tile_exists(uint32_t bg, uint32_t ov, float u0, float v0, float u1, 
     }
     return FALSE;
 }
+static int g_flushed = 0;  /* how many pairs already written to disk */
+static BOOL g_tsv_exists = FALSE;  /* set on startup if file already has data */
+
 static void flush_pairs(void) {
-    if (!g_npairs) return;
-    FILE *f = fopen("dc2_pairs.tsv","w"); if (!f) return;
-    fprintf(f, "bg_hash\toverlay_hash\toverlay_w\toverlay_h\tdraw_order\t"
-               "dst_x0\tdst_y0\tdst_x1\tdst_y1\tuv_u0\tuv_v0\tuv_u1\tuv_v1\n");
-    for (int i = 0; i < g_npairs; i++) {
+    if (g_npairs <= g_flushed) return;  /* nothing new */
+    
+    /* Append if file already existed on startup or we've written before */
+    const char *mode = (g_flushed == 0 && !g_tsv_exists) ? "w" : "a";
+    FILE *f = fopen("dc2_pairs.tsv", mode);
+    if (!f) return;
+    
+    if (g_flushed == 0 && !g_tsv_exists) {
+        fprintf(f, "bg_hash\toverlay_hash\toverlay_w\toverlay_h\tdraw_order\t"
+                   "dst_x0\tdst_y0\tdst_x1\tdst_y1\tuv_u0\tuv_v0\tuv_u1\tuv_v1\n");
+    }
+    
+    for (int i = g_flushed; i < g_npairs; i++) {
         pair_t *p = &g_pairs[i];
         fprintf(f, "%08X\t%08X\t%u\t%u\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.4f\t%.4f\t%.4f\t%.4f\n",
             p->bg_hash, p->overlay_hash, p->ow, p->oh, p->draw_order,
             p->dx0,p->dy0,p->dx1,p->dy1, p->u0,p->v0,p->u1,p->v1);
     }
     fclose(f);
-    LOG("Flushed %d pairs\n", g_npairs);
+    LOG("Flushed %d new pairs (total %d)\n", g_npairs - g_flushed, g_npairs);
+    g_flushed = g_npairs;
 }
 
 /* ═══ STATE ═══ */
@@ -284,14 +298,19 @@ static BOOL install_hooks(void) {
 }
 
 static DWORD WINAPI init_thread(LPVOID x) {
-    LOG("\n===== DC2 Pair Logger v3 =====\n");
+    LOG("\n===== DC2 Pair Logger v4 (incremental save) =====\n");
     Sleep(5000);
+    
+    /* Check if TSV already exists (from previous session) */
+    g_tsv_exists = (GetFileAttributesA("dc2_pairs.tsv") != INVALID_FILE_ATTRIBUTES);
+    if (g_tsv_exists) LOG("Existing dc2_pairs.tsv found — will append\n");
+    
     if(!install_hooks()){LOG("FATAL\n");return 1;}
     for(int i=0;i<600;i++){
         Sleep(5000);
         if(i<20||(i%12==0))
             LOG("[%ds] frames=%d pairs=%d cache=%d\n",(i+1)*5,g_frames,g_npairs,g_ntc);
-        if((i+1)%12==0)flush_pairs();
+        if((i+1)%6==0)flush_pairs();  /* auto-flush every 30 seconds */
     }
     flush_pairs(); return 0;
 }
