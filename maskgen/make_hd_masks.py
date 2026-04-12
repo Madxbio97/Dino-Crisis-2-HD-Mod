@@ -111,6 +111,11 @@ def generate_hd_mask(mask_img, hd_bg_img, tiles, screen_w, screen_h):
     hd_mask_h = int(mask_h * bg_scale_y)
     hd_mask = np.zeros((hd_mask_h, hd_mask_w, 4), dtype=np.uint8)
     
+    # Pre-upscale alpha channel with bicubic interpolation for smooth edges
+    alpha_orig = Image.fromarray(mask_arr[:, :, 3])
+    alpha_hd = alpha_orig.resize((hd_mask_w, hd_mask_h), Image.BICUBIC)
+    alpha_hd_arr = np.array(alpha_hd)
+    
     print(f"  Screen: {screen_w}x{screen_h}")
     print(f"  HD bg: {hd_bg_w}x{hd_bg_h}, bg_scale: {bg_scale_x:.1f}x{bg_scale_y:.1f}")
     print(f"  HD mask: {hd_mask_w}x{hd_mask_h}")
@@ -152,15 +157,14 @@ def generate_hd_mask(mask_img, hd_bg_img, tiles, screen_w, screen_h):
         
         for hy in range(hd_my0, hd_my1):
             for hx in range(hd_mx0, hd_mx1):
+                # Check smooth upscaled alpha
+                alpha = alpha_hd_arr[hy, hx]
+                if alpha == 0:
+                    continue
+                
                 # HD mask pixel -> original mask texel
                 orig_mx = hx / bg_scale_x
                 orig_my = hy / bg_scale_y
-                
-                # Check alpha in original mask
-                imx = min(int(orig_mx), mask_w - 1)
-                imy = min(int(orig_my), mask_h - 1)
-                if mask_arr[imy, imx, 3] == 0:
-                    continue
                 
                 # Original mask texel -> normalized position within tile (0..1)
                 # Use original (unexpanded) UV for accurate screen mapping
@@ -179,7 +183,7 @@ def generate_hd_mask(mask_img, hd_bg_img, tiles, screen_w, screen_h):
                 iby = max(0, min(int(hd_by), hd_bg_h - 1))
                 
                 hd_mask[hy, hx, :3] = hd_bg_arr[iby, ibx, :3]
-                hd_mask[hy, hx, 3] = 255
+                hd_mask[hy, hx, 3] = alpha  # smooth anti-aliased alpha
     
     return Image.fromarray(hd_mask)
 
