@@ -1,6 +1,6 @@
 /*
- * Dino Crisis 2 — DX9 Texture Dumper + Replacer v6
- * Hash-table caches, negative caching, LRU eviction with VRAM budget.
+ * Dino Crisis 2 — DX9 Texture Dumper + Replacer v7
+ * Hash-table caches, negative caching, LRU eviction, no_repl optimization.
  *
  * BUILD (MSVC x86):
  *   cl /LD /O2 dino2hd_ext.c /link /OUT:dino2hd_ext.asi kernel32.lib user32.lib
@@ -221,7 +221,7 @@ static void store_replacement(uint32_t hash, UINT orig_w, UINT orig_h,
  * ═══════════════════════════════════════════════════════════════ */
 #define PTR_SIZE 16384  /* power of 2 */
 #define PTR_MASK (PTR_SIZE - 1)
-#define RECHECK_INTERVAL 2
+#define RECHECK_INTERVAL 5  /* check every 5 frames (was 2) */
 
 typedef struct {
     IDirect3DTexture9 *ptr;  /* NULL = empty */
@@ -231,6 +231,7 @@ typedef struct {
     UINT     w, h;
     DWORD    fmt;
     BOOL     dumped;
+    BOOL     no_repl;        /* TRUE = checked, no replacement file exists */
 } ptrcache_t;
 static ptrcache_t g_ptrcache[PTR_SIZE];
 
@@ -325,20 +326,19 @@ static void convert_row_to_bgra(uint8_t* dst, uint8_t* src, UINT w, DWORD fmt, B
 /* ═══ DUMP ═══ */
 static void dump_texture(uint32_t hash, void *bits, int pitch, UINT w, UINT h, DWORD fmt) {
     if (!g_webp) return;
+    char path[260]; sprintf(path,"dump\\textures\\%08X_%ux%u.webp", hash, w, h);
+    /* Skip if already dumped */
+    if (GetFileAttributesA(path)!=INVALID_FILE_ATTRIBUTES) return;
     uint8_t *bgra = (uint8_t*)malloc(w*h*4);
     if (!bgra) return;
     BOOL opaque = (w == 320 && h == 240);
     for (UINT y = 0; y < h; y++)
         convert_row_to_bgra(bgra + y * w * 4, (uint8_t*)bits + y * pitch, w, fmt, opaque);
-    CreateDirectoryA("dump",NULL); CreateDirectoryA("dump\\textures",NULL);
-    char path[260]; sprintf(path,"dump\\textures\\%08X_%ux%u.webp", hash, w, h);
-    if (GetFileAttributesA(path)==INVALID_FILE_ATTRIBUTES) {
-        uint8_t *out=NULL;
-        size_t sz=pWEnc(bgra, w, h, w*4, &out);
-        if (sz>0 && out) {
-            FILE *f=fopen(path,"wb"); if(f){fwrite(out,1,sz,f);fclose(f);g_dump_count++;}
-            pWFree(out);
-        }
+    uint8_t *out=NULL;
+    size_t sz=pWEnc(bgra, w, h, w*4, &out);
+    if (sz>0 && out) {
+        FILE *f=fopen(path,"wb"); if(f){fwrite(out,1,sz,f);fclose(f);g_dump_count++;}
+        pWFree(out);
     }
     free(bgra);
 }
@@ -435,11 +435,14 @@ static IDirect3DTexture9 *process_texture(IDirect3DTexture9 *tex) {
             pc->quick_hash = qh;
             pc->full_hash = 0;
             pc->dumped = FALSE;
+            pc->no_repl = FALSE;  /* content changed, re-check */
             pc->last_frame = g_frames;
         } else if (g_frames - pc->last_frame < RECHECK_INTERVAL) {
             uint32_t fh = pc->full_hash;
+            BOOL skip = pc->no_repl;
             LeaveCriticalSection(&g_cs);
             ((TexUnlockRect_t)vt[VT_TEX_UnlockRect])(tex, 0);
+            if (skip) return NULL;  /* known no replacement — skip entirely */
             if (g_replace && fh) {
                 BOOL chk;
                 return find_replacement(fh, &chk);
@@ -478,7 +481,14 @@ static IDirect3DTexture9 *process_texture(IDirect3DTexture9 *tex) {
 
     /* Ищем/загружаем замену */
     if (g_replace && g_dev) {
-        return load_replacement(fh, desc.Width, desc.Height);
+        IDirect3DTexture9 *repl = load_replacement(fh, desc.Width, desc.Height);
+        if (!repl) {
+            /* No replacement file — mark to skip full_hash next time */
+            EnterCriticalSection(&g_cs);
+            pc->no_repl = TRUE;
+            LeaveCriticalSection(&g_cs);
+        }
+        return repl;
     }
     return NULL;
 }
@@ -542,10 +552,11 @@ static BOOL install_hooks(void) {
 
 /* ═══ THREAD ═══ */
 static DWORD WINAPI init_thread(LPVOID x) {
-    LOG("\n===== DC2 Texture Hook v6 (LRU eviction) =====\n");
+    LOG("\n===== DC2 Texture Hook v7 =====\n");
     Sleep(5000);
     InitializeCriticalSection(&g_cs);
     load_webp();
+    CreateDirectoryA("dump",NULL); CreateDirectoryA("dump\\textures",NULL);
     CreateDirectoryA("hires",NULL); CreateDirectoryA("hires\\textures",NULL);
     if (!install_hooks()) { LOG("FATAL\n"); return 1; }
     for (int i=0;i<600;i++) {
